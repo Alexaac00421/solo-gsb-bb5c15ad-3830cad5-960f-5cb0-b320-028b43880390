@@ -394,12 +394,34 @@ function activeInterruption(versionId) {
   ).get(versionId) || null;
 }
 
+// 某时刻落入的停排区间（半开 [pause, resume)；进行中的停排以 [pause, +∞) 处理）；无则 null
+function interruptionAtMinute(versionId, minute) {
+  return db.prepare(
+    'SELECT id, pause_minute, resume_minute, reason FROM rehearsal_interruptions WHERE version_id = ?'
+  ).all(versionId).find((it) =>
+    minute >= it.pause_minute && (it.resume_minute === null || minute < it.resume_minute)) || null;
+}
+
 // 某时刻是否落入该版本任一段停排区间（半开 [pause, resume)；进行中的停排以 [pause, +∞) 处理）
 function timeInAnyInterruption(versionId, minute) {
-  return db.prepare(
-    'SELECT id, pause_minute, resume_minute FROM rehearsal_interruptions WHERE version_id = ?'
-  ).all(versionId).some((it) =>
-    minute >= it.pause_minute && (it.resume_minute === null || minute < it.resume_minute));
+  return interruptionAtMinute(versionId, minute) !== null;
+}
+
+// 实际时刻落入停排区间时的统一拒绝（400 INTERRUPTION_TIME_CONFLICT）：
+// 半开 [停排, 恢复)——停排起点不可登记、恢复时刻可登记；进行中的停排理论上已被
+// INTERRUPTION_ACTIVE 先行拦截，此处按同口径兜底。返回错误供调用方在同一写事务内抛出，
+// 抛出错误时登记、行版本、双签效力、顺延待确认与更正历史均不变化。
+function interruptionTimeConflictError(versionId, fieldLabel, minute) {
+  const seg = interruptionAtMinute(versionId, minute);
+  const intervalText = seg
+    ? `${minToTime(seg.pause_minute)}–${seg.resume_minute === null ? '（停排中）' : minToTime(seg.resume_minute)}`
+    : '';
+  return new ApiError(400, 'INTERRUPTION_TIME_CONFLICT',
+    `${fieldLabel} ${minToTime(minute)} 落入联排停排区间${seg ? `（${intervalText}${seg.reason ? `，原因：${seg.reason}` : ''}）` : ''}，停排期间没有实际执行，请改为停排前或恢复后的时刻（停排起点不可登记、恢复时刻可登记；执行过程跨越停排的，起止时刻均在区间外即可登记）`,
+    { time: minute, timeText: minToTime(minute),
+      interruptionId: seg ? seg.id : null,
+      pauseText: seg ? minToTime(seg.pause_minute) : null,
+      resumeText: seg && seg.resume_minute !== null ? minToTime(seg.resume_minute) : null });
 }
 
 // 联排中断记录 JSON（现场与历史回看共用）
@@ -1705,6 +1727,14 @@ app.post('/api/registrations', requireAuth, (req, res, next) => {
 
       if (action === 'start') {
         if (reg.actual_start !== null) throw new ApiError(400, 'BAD_STATE', `「${pc.code}」已登记实际开始`);
+        const t = parseOptTime(req.body.time) ?? currentMinute();
+        // 实际开始不得落入该版任一段停排区间（半开 [停排, 恢复)，含已结束的停排）：
+        // 停排恢复后岗位可手填实际时刻，但停排起点不可登记、恢复时刻可登记；
+        // 起止均在区间外、执行过程跨越停排的登记允许，复盘仍按既有规则扣除停排交集。
+        // 该校验先于放行门禁：冲突请求不触发门禁内的失效传播，拒绝时双签效力保持不变。
+        if (interruptionAtMinute(versionId, t)) {
+          throw interruptionTimeConflictError(versionId, '实际开始', t);
+        }
         // 需放行项：两类有效签认（执行人就绪 + 舞监可执行）齐备才能登记实际开始；
         // 同一事务内复核签认快照与当前登记行版本，缺签/失效整体拒绝，不写入任何登记
         if (pc.needs_release === 1) {
@@ -1715,7 +1745,6 @@ app.post('/api/registrations', requireAuth, (req, res, next) => {
               { items: gate.items.map((i) => ({ ...i, cueRef, code: pc.code })) });
           }
         }
-        const t = parseOptTime(req.body.time) ?? currentMinute();
         patch = { actual_start: t };
       } else if (action === 'estimate') {
         if (reg.actual_end !== null) throw new ApiError(400, 'BAD_STATE', `「${pc.code}」已完成，不能再修改预计结束`);
@@ -1748,6 +1777,11 @@ app.post('/api/registrations', requireAuth, (req, res, next) => {
         if (reg.actual_end !== null) throw new ApiError(400, 'BAD_STATE', `「${pc.code}」已完成`);
         const t = parseOptTime(req.body.time) ?? currentMinute();
         if (t < reg.actual_start) throw new ApiError(400, 'BAD_INPUT', `完成时刻 ${minToTime(t)} 早于实际开始 ${minToTime(reg.actual_start)}`);
+        // 实际完成同样不得落入任一段停排区间（半开 [停排, 恢复)，含已结束的停排）；
+        // 开始在停排前、完成在恢复后的跨越登记允许，复盘扣除两者与停排段的交集。
+        if (interruptionAtMinute(versionId, t)) {
+          throw interruptionTimeConflictError(versionId, '实际完成', t);
+        }
         patch = { actual_end: t };
       } else {
         throw new ApiError(400, 'BAD_INPUT', '未知登记动作');
